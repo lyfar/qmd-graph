@@ -33,6 +33,36 @@ GRAPH_DB = os.environ.get(
 )
 WIKILINK_RE = re.compile(r'\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]')
 
+# Labeled edge pattern: `[label]` [[Target]]
+# Matches lines like: - `[source]` [[Some Note]]
+# The backticks around [label] are optional
+LABELED_LINK_RE = re.compile(
+    r'`?\[('
+    r'source|implements|used-in|see-also|applies|extends|'
+    r'contradicts|depends-on|broader|narrower|example|'
+    r'part-of|output|input|related'
+    r')\]`?\s*\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]'
+)
+
+# Edge weights by relationship type
+# Strong structural/causal links > weak associative links
+EDGE_WEIGHTS = {
+    'source':      1.0,   # derived from, strong provenance
+    'implements':  1.0,   # directly builds on
+    'depends-on':  1.0,   # can't exist without
+    'extends':     0.9,   # builds on top of
+    'part-of':     0.9,   # structural containment
+    'contradicts': 0.8,   # tension = strong signal
+    'applies':     0.8,   # used in practice
+    'used-in':     0.8,   # actively referenced
+    'narrower':    0.7,   # taxonomy child
+    'broader':     0.6,   # taxonomy parent (weaker: too generic)
+    'example':     0.6,   # illustrative
+    'related':     0.4,   # vague association
+    'see-also':    0.3,   # weakest: "might be interesting"
+}
+DEFAULT_WEIGHT = 0.5  # unlabeled [[wikilinks]]
+
 
 # --- Graph DB ---
 
@@ -48,6 +78,8 @@ def init_graph_db(conn):
         CREATE TABLE IF NOT EXISTS edges (
             source_id INTEGER NOT NULL,
             target_id INTEGER NOT NULL,
+            weight REAL NOT NULL DEFAULT 0.5,
+            label TEXT,
             UNIQUE(source_id, target_id),
             FOREIGN KEY(source_id) REFERENCES nodes(id),
             FOREIGN KEY(target_id) REFERENCES nodes(id)
@@ -107,8 +139,9 @@ def build_graph(collection=None, verbose=False):
             "SELECT id FROM nodes WHERE name=?", (norm,)
         ).fetchone()[0]
 
-    # Parse wikilinks from content and build edges
+    # Parse wikilinks from content and build edges (with labels and weights)
     edge_count = 0
+    label_counts = {}
     for norm, (doc_id, coll, path, display) in node_map.items():
         content = qmd.execute(
             "SELECT c.doc FROM documents d JOIN content c ON d.hash=c.hash WHERE d.id=?",
@@ -117,17 +150,29 @@ def build_graph(collection=None, verbose=False):
         if not content:
             continue
 
-        links = WIKILINK_RE.findall(content[0])
+        text = content[0]
         source_id = node_ids[norm]
 
-        for link in links:
+        # First pass: collect labeled links (these override unlabeled ones)
+        labeled = {}
+        for label, link in LABELED_LINK_RE.findall(text):
+            target_norm = normalize_name(link)
+            if target_norm in node_ids and target_norm != norm:
+                labeled[target_norm] = label
+                label_counts[label] = label_counts.get(label, 0) + 1
+
+        # Second pass: all wikilinks (labeled ones get their weight, unlabeled get DEFAULT)
+        all_links = WIKILINK_RE.findall(text)
+        for link in all_links:
             target_norm = normalize_name(link)
             if target_norm in node_ids and target_norm != norm:
                 target_id = node_ids[target_norm]
+                label = labeled.get(target_norm)
+                weight = EDGE_WEIGHTS.get(label, DEFAULT_WEIGHT) if label else DEFAULT_WEIGHT
                 try:
                     graph.execute(
-                        "INSERT OR IGNORE INTO edges (source_id, target_id) VALUES (?,?)",
-                        (source_id, target_id)
+                        "INSERT OR IGNORE INTO edges (source_id, target_id, weight, label) VALUES (?,?,?,?)",
+                        (source_id, target_id, weight, label)
                     )
                     edge_count += 1
                 except sqlite3.IntegrityError:
@@ -146,6 +191,10 @@ def build_graph(collection=None, verbose=False):
     graph.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
         ("edge_count", str(edge_count))
+    )
+    graph.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("label_counts", json.dumps(label_counts))
     )
 
     graph.commit()
@@ -195,16 +244,19 @@ def shortest_path(start_query, end_query):
     queue = deque([(start[0], [start[0]])])
     visited = {start[0]}
 
-    # Build adjacency (undirected)
+    # Build adjacency with weights and labels (undirected)
     adj = {}
-    for s, t in conn.execute("SELECT source_id, target_id FROM edges").fetchall():
+    edge_meta = {}  # (s, t) -> (weight, label)
+    for s, t, w, lbl in conn.execute("SELECT source_id, target_id, weight, label FROM edges").fetchall():
         adj.setdefault(s, []).append(t)
         adj.setdefault(t, []).append(s)
+        edge_meta[(s, t)] = (w, lbl)
+        edge_meta[(t, s)] = (w, lbl)
 
     while queue:
         node, path = queue.popleft()
         if node == end[0]:
-            # Found! Print path
+            # Found! Print path with edge labels
             names = []
             for nid in path:
                 row = conn.execute("SELECT name, path FROM nodes WHERE id=?", (nid,)).fetchone()
@@ -212,8 +264,14 @@ def shortest_path(start_query, end_query):
             print(f"\nPath ({len(names)-1} hops):\n")
             for i, (name, fpath) in enumerate(names):
                 display = name.replace("-", " ").title()
-                prefix = "  → " if i > 0 else "  ● "
-                print(f"{prefix}{display}  ({fpath})")
+                if i == 0:
+                    print(f"  ● {display}  ({fpath})")
+                else:
+                    prev_id = path[i-1]
+                    curr_id = path[i]
+                    w, lbl = edge_meta.get((prev_id, curr_id), (0.5, None))
+                    label_str = f"  [{lbl} {w}]" if lbl else f"  [{w}]"
+                    print(f"  → {display}  ({fpath}){label_str}")
             conn.close()
             return names
 
@@ -367,13 +425,15 @@ def spreading_activation(query, top_n=10, decay=0.5):
         print(f"Node not found: {query}")
         return
 
-    # Build adjacency (undirected)
-    adj = {}
-    for s, t in conn.execute("SELECT source_id, target_id FROM edges").fetchall():
-        adj.setdefault(s, set()).add(t)
-        adj.setdefault(t, set()).add(s)
+    # Build adjacency with weights (undirected)
+    adj = {}  # node -> [(neighbor, weight)]
+    for s, t, w in conn.execute("SELECT source_id, target_id, weight FROM edges").fetchall():
+        adj.setdefault(s, []).append((t, w))
+        adj.setdefault(t, []).append((s, w))
 
-    # Spreading activation (BFS-based, bounded)
+    # Spreading activation (BFS-based, bounded, weight-aware)
+    # Strong edges (source, implements) propagate more activation
+    # Weak edges (see-also) propagate less
     activation = {}
     visited_depth = {seed[0]: 0}
     queue = deque([(seed[0], 1.0, 0)])
@@ -384,12 +444,13 @@ def spreading_activation(query, top_n=10, decay=0.5):
         if depth >= max_depth:
             continue
 
-        new_act = act * decay
-        if new_act < 0.01:
-            continue
+        for neighbor, edge_weight in adj.get(node, []):
+            # Activation = parent_activation * decay * edge_weight
+            new_act = act * decay * edge_weight
+            if new_act < 0.01:
+                continue
 
-        for neighbor in adj.get(node, set()):
-            # Accumulate activation
+            # Accumulate activation (multiple paths strengthen the signal)
             activation[neighbor] = activation.get(neighbor, 0) + new_act
 
             # Only traverse each node once (BFS guarantee)
@@ -457,6 +518,19 @@ def stats():
                 row = conn.execute("SELECT name, path FROM nodes WHERE id=?", (nid,)).fetchone()
                 display = row[0].replace("-", " ").title()
                 print(f"    {display} ({deg} connections)")
+
+        # Edge label distribution
+        label_data = conn.execute("SELECT value FROM meta WHERE key='label_counts'").fetchone()
+        if label_data:
+            labels = json.loads(label_data[0])
+            if labels:
+                print(f"\n  Edge labels:")
+                for lbl, cnt in sorted(labels.items(), key=lambda x: -x[1]):
+                    w = EDGE_WEIGHTS.get(lbl, DEFAULT_WEIGHT)
+                    print(f"    [{lbl}] {cnt} (weight {w})")
+                unlabeled = edges - sum(labels.values())
+                if unlabeled > 0:
+                    print(f"    [unlabeled] {unlabeled} (weight {DEFAULT_WEIGHT})")
 
         if last_build:
             print(f"\n  Last build: {last_build[0]}")
